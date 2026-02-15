@@ -218,7 +218,7 @@ export async function checkOfflineStatus(
     } else {
       // 服务器在线
       if (offlineMap.get(name)) {
-        offlineMap.set(name, false);
+        offlineMap.delete(name);
         notifications.push(sendTGMessage(token, chatId, onlineMessage(name)));
       }
     }

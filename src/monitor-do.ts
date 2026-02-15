@@ -25,12 +25,100 @@ import {
 import { decompressGzip, sortByName, compareStrings } from "./utils";
 import { checkOfflineStatus } from "./telegram";
 
+// ================================================================
+// 常量
+// ================================================================
+
+/** monitorData Map 最大条目数，防止无限增长 */
+const MONITOR_DATA_MAX_ENTRIES = 500;
+
+/** 恢复快照时的最大存活时间（秒） */
+const SNAPSHOT_MAX_AGE_SEC = 300;
+
+/** 定时器间隔（毫秒） */
+const ALARM_INTERVAL_MS = 20_000;
+
+/** 离线检测阈值（秒） */
+const OFFLINE_THRESHOLD_SEC = 60;
+
+// ================================================================
+// WebSocket attachment 类型
+// ================================================================
+
+/** 存储在 WebSocket attachment 中的状态，可跨休眠持久化 */
+interface AgentAttachment {
+  authed: boolean;
+}
+
+// ================================================================
+// 辅助函数：tryDecompressStringMessage
+// ================================================================
+
+/**
+ * 当 Go 客户端使用 TextMessage 发送 gzip 二进制数据时，
+ * CF Workers 将文本帧以 UTF-8 解码为 string，可能损坏二进制内容。
+ *
+ * 此函数尝试多种策略从可能损坏的文本消息中提取 JSON：
+ *   1. 直接解析为 JSON（如果数据根本未压缩）
+ *   2. Latin-1 编码恢复字节 → gzip 解压
+ *   3. UTF-8 编码 → gzip 解压（通常失败但作为兜底）
+ *
+ * @returns 解压/解析后的 JSON 字符串，或 null 表示全部失败
+ */
+async function tryDecompressStringMessage(
+  message: string,
+): Promise<string | null> {
+  // 策略 1：直接尝试 JSON 解析（未压缩的纯 JSON 文本）
+  try {
+    JSON.parse(message);
+    // 如果成功解析，说明是合法的 JSON 字符串，直接返回
+    return message;
+  } catch {
+    // 不是合法 JSON，继续尝试其他策略
+  }
+
+  // 策略 2：将每个字符视为 Latin-1 字节值恢复原始二进制数据
+  // 当 UTF-8 解码未严重损坏数据时（低 ASCII 区域），这可能有效
+  try {
+    const bytes = new Uint8Array(message.length);
+    for (let i = 0; i < message.length; i++) {
+      bytes[i] = message.charCodeAt(i) & 0xff;
+    }
+    const jsonStr = await decompressGzip(bytes.buffer as ArrayBuffer);
+    // 验证解压结果是否为合法 JSON
+    JSON.parse(jsonStr);
+    return jsonStr;
+  } catch {
+    // Latin-1 恢复失败
+  }
+
+  // 策略 3：使用 TextEncoder 编码为 UTF-8 字节，再尝试解压
+  try {
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(message);
+    const jsonStr = await decompressGzip(bytes.buffer as ArrayBuffer);
+    JSON.parse(jsonStr);
+    return jsonStr;
+  } catch {
+    // UTF-8 编码恢复也失败
+  }
+
+  return null;
+}
+
+// ================================================================
+// MonitorDO 类
+// ================================================================
+
 /**
  * MonitorDO — 全局单例 Durable Object 实例，持有所有监控状态，
  * 并管理来自 Agent 和前端 Viewer 的 WebSocket 连接。
  *
  * 使用可休眠 WebSocket API，使 DO 在消息间隙可以从内存中驱逐，
  * 从而节省空闲部署的成本。
+ *
+ * 认证状态通过 ws.serializeAttachment / ws.deserializeAttachment
+ * 持久化，确保 DO 休眠后唤醒时认证状态不丢失。
  */
 export class MonitorDO implements DurableObject {
   // ── 运行时状态（内存中，替代内存 SQLite）──
@@ -41,11 +129,11 @@ export class MonitorDO implements DurableObject {
   /** 跟踪哪些服务器已知处于离线状态（用于 TG 通知） */
   private offlineMap: Map<string, boolean> = new Map();
 
-  /** 是否已从持久化存储加载主机信息 */
+  /** 是否已从持久化存储加载数据 */
   private initialized: boolean = false;
 
-  /** 用于跟踪哪些 Agent WebSocket 已完成认证的集合 */
-  private authedAgents: Set<WebSocket> = new Set();
+  /** 缓存的 Viewer 广播 payload，当 monitorData 更新时置为 null 以失效 */
+  private cachedViewerPayload: string | null = null;
 
   // ── 由运行时注入 ──
   private state: DurableObjectState;
@@ -97,8 +185,12 @@ export class MonitorDO implements DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = [pair[0], pair[1]];
 
-    // 以可休眠模式接受连接；标记为 "agent" + "unauthed"
-    this.state.acceptWebSocket(server, ["agent", "unauthed"]);
+    // 以可休眠模式接受连接；标记为 "agent"
+    this.state.acceptWebSocket(server, ["agent"]);
+
+    // 设置初始 attachment：未认证状态
+    // serializeAttachment 将状态持久化，确保跨休眠存活
+    server.serializeAttachment({ authed: false } satisfies AgentAttachment);
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -122,7 +214,10 @@ export class MonitorDO implements DurableObject {
   // ================================================================
 
   /**
-   * 当收到 WebSocket 消息时调用（来自 Agent 或 Viewer）
+   * 当收到 WebSocket 消息时调用（来自 Agent 或 Viewer）。
+   *
+   * 认证状态通过 WebSocket attachment 持久化，
+   * 确保 DO 休眠后再唤醒时认证信息不丢失。
    */
   async webSocketMessage(
     ws: WebSocket,
@@ -130,68 +225,37 @@ export class MonitorDO implements DurableObject {
   ): Promise<void> {
     const tags = this.state.getTags(ws);
     const isAgent = tags.includes("agent");
-    const isUnauthed = tags.includes("unauthed");
 
     // ── Agent 连接 ──
     if (isAgent) {
-      // 第一步：认证（第一条消息必须是 auth_secret）
-      if (isUnauthed) {
-        const text =
-          typeof message === "string"
-            ? message
-            : new TextDecoder().decode(message);
+      // 从 attachment 中读取认证状态（跨休眠安全）
+      const attachment =
+        (ws.deserializeAttachment() as AgentAttachment | null) ?? {
+          authed: false,
+        };
 
-        if (text !== this.env.AUTH_SECRET) {
-          console.log("Agent 认证失败，关闭连接");
-          ws.close(1008, "auth failed");
-          return;
-        }
-
-        // 认证成功 — 由于无法在 accept 之后修改标签，
-        // 我们使用内存中的 Set 来跟踪已认证的 Agent。
-        // 一旦认证通过，后续消息将被放行。
-        this.authedAgents.add(ws);
-
-        ws.send("auth success");
-        this.ensureAlarm();
+      if (attachment.authed) {
+        // 已认证 → 处理监控数据
+        await this.handleAgentData(ws, message);
         return;
       }
 
-      // 第二步：必须已认证才能发送数据
-      if (!this.authedAgents.has(ws)) {
-        // 仍标记为未认证但不是第一条消息，不应发生
-        ws.close(1008, "auth required");
+      // 未认证 → 第一条消息必须是 auth_secret
+      const text =
+        typeof message === "string"
+          ? message
+          : new TextDecoder().decode(message);
+
+      if (text !== this.env.AUTH_SECRET) {
+        console.log("Agent 认证失败，关闭连接");
+        ws.close(1008, "auth failed");
         return;
       }
 
-      // 第三步：解压 gzip 数据包并存储
-      try {
-        let jsonStr: string;
-
-        if (typeof message === "string") {
-          // 可能是未压缩的数据（不太可能，但优雅处理）
-          jsonStr = message;
-        } else {
-          // 二进制 → gzip 压缩的 JSON（标准 Agent 行为）
-          jsonStr = await decompressGzip(message);
-        }
-
-        const data: MonitorData = JSON.parse(jsonStr);
-
-        if (!data.Host?.Name) {
-          console.error("Agent 消息缺少 Host.Name");
-          return;
-        }
-
-        // 存储到内存中（替代 SQLite 的 INSERT/UPDATE）
-        this.monitorData.set(data.Host.Name, jsonStr);
-
-        // 广播给所有已连接的 Viewer
-        this.broadcastToViewers();
-      } catch (err) {
-        console.error("Agent 消息处理错误:", err);
-      }
-
+      // 认证成功 — 将状态持久化到 attachment 中
+      ws.serializeAttachment({ authed: true } satisfies AgentAttachment);
+      ws.send("auth success");
+      this.ensureAlarm();
       return;
     }
 
@@ -199,7 +263,7 @@ export class MonitorDO implements DurableObject {
     // 原始 Go 行为：Viewer 发送任意消息 → 服务端回复
     // 带 "data: " 前缀的所有当前数据
     if (tags.includes("viewer")) {
-      const payload = this.buildViewerPayload();
+      const payload = this.getViewerPayload();
       try {
         ws.send("data: " + payload);
       } catch (err) {
@@ -210,17 +274,19 @@ export class MonitorDO implements DurableObject {
   }
 
   /**
-   * 当 WebSocket 关闭时调用
+   * 当 WebSocket 关闭时调用。
+   *
+   * 注意：此回调由运行时在 WS 已经关闭/正在关闭时触发，
+   * 不应再次调用 ws.close()，否则会抛出异常。
    */
   async webSocketClose(
     ws: WebSocket,
-    code: number,
-    reason: string,
-    wasClean: boolean,
+    _code: number,
+    _reason: string,
+    _wasClean: boolean,
   ): Promise<void> {
-    // 清理已认证 Agent 的跟踪记录
-    this.authedAgents.delete(ws);
-    ws.close(code, reason);
+    // WebSocket 已经在关闭流程中，不需要再次 close。
+    // 仅做清理工作即可。
   }
 
   /**
@@ -228,11 +294,74 @@ export class MonitorDO implements DurableObject {
    */
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     console.error("WebSocket 错误:", error);
-    this.authedAgents.delete(ws);
     try {
       ws.close(1011, "internal error");
     } catch {
-      // 连接已经关闭
+      // 连接可能已经关闭，忽略
+    }
+  }
+
+  // ================================================================
+  // Agent 数据处理
+  // ================================================================
+
+  /**
+   * 处理已认证 Agent 发送的监控数据消息。
+   * 支持二进制帧（正确方式）和文本帧（Go 客户端的兼容方式）。
+   */
+  private async handleAgentData(
+    ws: WebSocket,
+    message: string | ArrayBuffer,
+  ): Promise<void> {
+    try {
+      let jsonStr: string;
+
+      if (typeof message === "string") {
+        // Go 客户端使用 websocket.TextMessage 发送 gzip 二进制数据，
+        // CF Workers 将文本帧 UTF-8 解码为 string，可能损坏二进制内容。
+        // 使用多策略容错解压函数处理。
+        const result = await tryDecompressStringMessage(message);
+        if (result === null) {
+          console.error(
+            "Agent 文本消息解压/解析全部失败，丢弃。长度:",
+            message.length,
+          );
+          return;
+        }
+        jsonStr = result;
+      } else {
+        // 二进制帧 → gzip 压缩的 JSON（正确的发送方式）
+        jsonStr = await decompressGzip(message);
+      }
+
+      const data: MonitorData = JSON.parse(jsonStr);
+
+      if (!data.Host?.Name) {
+        console.error("Agent 消息缺少 Host.Name");
+        return;
+      }
+
+      // 检查并执行大小限制
+      if (
+        !this.monitorData.has(data.Host.Name) &&
+        this.monitorData.size >= MONITOR_DATA_MAX_ENTRIES
+      ) {
+        console.warn(
+          `monitorData 已达上限 (${MONITOR_DATA_MAX_ENTRIES})，拒绝新节点: ${data.Host.Name}`,
+        );
+        return;
+      }
+
+      // 存储到内存中（替代 SQLite 的 INSERT/UPDATE）
+      this.monitorData.set(data.Host.Name, jsonStr);
+
+      // 使缓存的 Viewer payload 失效
+      this.cachedViewerPayload = null;
+
+      // 广播给所有已连接的 Viewer
+      this.broadcastToViewers();
+    } catch (err) {
+      console.error("Agent 消息处理错误:", err);
     }
   }
 
@@ -259,7 +388,7 @@ export class MonitorDO implements DurableObject {
         this.offlineMap,
         this.env.TG_TOKEN,
         this.env.TG_CHAT_ID,
-        60, // 阈值秒数，与 Go 的 60 秒检查保持一致
+        OFFLINE_THRESHOLD_SEC,
       );
     }
 
@@ -269,7 +398,7 @@ export class MonitorDO implements DurableObject {
     // 3. 如果仍有已连接的 Socket 或监控数据，重新调度定时器
     const sockets = this.state.getWebSockets();
     if (sockets.length > 0 || this.monitorData.size > 0) {
-      this.state.storage.setAlarm(Date.now() + 20_000); // 20 秒
+      this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
     }
   }
 
@@ -298,24 +427,24 @@ export class MonitorDO implements DurableObject {
           return this.rpcDeleteHost(body as unknown as DeleteHostRequest);
 
         default:
-          return jsonResponse({ success: false, error: "未知的操作" }, 400);
+          return doJsonResponse({ success: false, error: "未知的操作" }, 400);
       }
     } catch (err) {
       console.error("RPC 错误:", err);
-      return jsonResponse({ success: false, error: String(err) }, 500);
+      return doJsonResponse({ success: false, error: String(err) }, 500);
     }
   }
 
   /** GET /hook — 以 JSON 数组形式返回所有监控数据 */
   private rpcFetchData(): Response {
     const monitors = this.getAllMonitorData();
-    return jsonResponse({ success: true, data: monitors });
+    return doJsonResponse({ success: true, data: monitors });
   }
 
   /** GET /info — 从持久化存储返回所有主机元信息 */
   private async rpcGetInfo(): Promise<Response> {
     const allHosts = await this.loadAllHostInfo();
-    return jsonResponse({ success: true, data: allHosts });
+    return doJsonResponse({ success: true, data: allHosts });
   }
 
   /** POST /info — 创建或更新主机元信息 */
@@ -330,7 +459,7 @@ export class MonitorDO implements DurableObject {
 
     await this.state.storage.put(`host:${req.name}`, JSON.stringify(hostInfo));
 
-    return jsonResponse({ success: true, data: "ok" });
+    return doJsonResponse({ success: true, data: "ok" });
   }
 
   /** POST /delete — 从内存监控数据中移除一台服务器 */
@@ -338,16 +467,19 @@ export class MonitorDO implements DurableObject {
     const name = req.name;
 
     if (!this.monitorData.has(name)) {
-      return jsonResponse({ success: false, error: "未找到" }, 404);
+      return doJsonResponse({ success: false, error: "未找到" }, 404);
     }
 
     this.monitorData.delete(name);
     this.offlineMap.delete(name);
 
+    // 使缓存的 Viewer payload 失效
+    this.cachedViewerPayload = null;
+
     // 同时移除持久化的快照条目
     await this.state.storage.delete(`monitor:${name}`);
 
-    return jsonResponse({ success: true, data: "ok" });
+    return doJsonResponse({ success: true, data: "ok" });
   }
 
   // ================================================================
@@ -376,12 +508,16 @@ export class MonitorDO implements DurableObject {
   }
 
   /**
-   * 构建发送给 Viewer WebSocket 客户端的 JSON 数据包。
-   * 与 Go `fetchData()` 函数的输出格式一致。
+   * 获取 Viewer 广播 payload（带缓存）。
+   * 当 monitorData 更新时 cachedViewerPayload 被置 null，
+   * 下次调用会重新构建。避免每条 Agent 消息都全量序列化。
    */
-  private buildViewerPayload(): string {
-    const monitors = this.getAllMonitorData();
-    return JSON.stringify(monitors);
+  private getViewerPayload(): string {
+    if (this.cachedViewerPayload === null) {
+      const monitors = this.getAllMonitorData();
+      this.cachedViewerPayload = JSON.stringify(monitors);
+    }
+    return this.cachedViewerPayload;
   }
 
   /**
@@ -392,7 +528,7 @@ export class MonitorDO implements DurableObject {
     const viewers = this.state.getWebSockets("viewer");
     if (viewers.length === 0) return;
 
-    const payload = "data: " + this.buildViewerPayload();
+    const payload = "data: " + this.getViewerPayload();
 
     for (const ws of viewers) {
       try {
@@ -432,6 +568,8 @@ export class MonitorDO implements DurableObject {
   /**
    * 将当前 monitorData 持久化到 Durable Storage，
    * 以便在 DO 驱逐/重启后存活。
+   *
+   * 使用批量 put 减少 I/O 次数。
    */
   private async persistMonitorSnapshot(): Promise<void> {
     const puts: Record<string, string> = {};
@@ -455,41 +593,53 @@ export class MonitorDO implements DurableObject {
     });
 
     const now = Math.floor(Date.now() / 1000);
-    const maxAge = 300; // 5 分钟
+
+    // 收集需要删除的过时条目
+    const keysToDelete: string[] = [];
 
     for (const [key, value] of entries) {
       try {
         const m: MonitorData = JSON.parse(value);
-        if (m.Host?.Name && m.TimeStamp > now - maxAge) {
+        if (m.Host?.Name && m.TimeStamp > now - SNAPSHOT_MAX_AGE_SEC) {
           this.monitorData.set(m.Host.Name, value);
         } else {
-          // 过时数据 — 清理掉
-          await this.state.storage.delete(key);
+          // 过时数据
+          keysToDelete.push(key);
         }
       } catch {
-        await this.state.storage.delete(key);
+        keysToDelete.push(key);
       }
+    }
+
+    // 批量删除过时/损坏的条目
+    if (keysToDelete.length > 0) {
+      await this.state.storage.delete(keysToDelete);
     }
   }
 
   /**
-   * 确保定时器已调度。在第一个 Agent 连接时调用，
-   * 或在需要启动离线检测周期时调用。
+   * 确保定时器已调度。在第一个 Agent 连接认证成功时调用。
+   * 使用 async/await 替代裸 .then()，附带错误处理。
    */
   private ensureAlarm(): void {
-    this.state.storage.getAlarm().then((currentAlarm) => {
-      if (currentAlarm === null) {
-        this.state.storage.setAlarm(Date.now() + 20_000);
+    (async () => {
+      try {
+        const currentAlarm = await this.state.storage.getAlarm();
+        if (currentAlarm === null) {
+          await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+        }
+      } catch (err) {
+        console.error("ensureAlarm 失败:", err);
       }
-    });
+    })();
   }
 }
 
 // ================================================================
-// 辅助函数：JSON 响应构建器
+// 辅助函数：JSON 响应构建器（DO 内部使用）
 // ================================================================
 
-function jsonResponse(
+function doJsonResponse(
   body: DOResponse | object,
   status: number = 200,
 ): Response {

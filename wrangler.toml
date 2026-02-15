@@ -1,6 +1,6 @@
 name = "akile-monitor"
 main = "src/index.ts"
-compatibility_date = "2024-12-01"
+compatibility_date = "2025-06-01"
 compatibility_flags = ["nodejs_compat"]
 
 [durable_objects]
@@ -10,7 +10,21 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["MonitorDO"]
+new_sqlite_classes = ["MonitorDO"]
+
+[observability]
+[observability.logs]
+enabled = false
+invocation_logs = true
+
+# ⚠️ 安全提示：AUTH_SECRET、HOOK_TOKEN、TG_TOKEN 等敏感值不应明文写在此处。
+# 生产环境请使用 `wrangler secret put <KEY>` 将其存储为加密 secret，
+# 然后从下方 [vars] 中移除对应条目。Worker 代码通过 env 访问方式不变。
+#
+# 示例：
+#   npx wrangler secret put AUTH_SECRET
+#   npx wrangler secret put HOOK_TOKEN
+#   npx wrangler secret put TG_TOKEN
 
 [vars]
 AUTH_SECRET = "auth_secret"
