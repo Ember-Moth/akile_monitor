@@ -1,0 +1,16 @@
+{
+  "name": "akile-monitor-worker",
+  "version": "1.0.0",
+  "description": "Akile Monitor server rewritten with Cloudflare Workers + Durable Objects",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241127.0",
+    "typescript": "^5.6.3",
+    "wrangler": "^3.91.0"
+  }
+}

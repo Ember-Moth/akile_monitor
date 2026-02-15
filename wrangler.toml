@@ -1,0 +1,23 @@
+name = "akile-monitor"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[durable_objects]
+bindings = [
+  { name = "MONITOR_DO", class_name = "MonitorDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["MonitorDO"]
+
+[vars]
+AUTH_SECRET = "auth_secret"
+HOOK_TOKEN = "hook_token"
+ENABLE_TG = "false"
+TG_TOKEN = ""
+TG_CHAT_ID = "0"
+UPDATE_URI = "/monitor"
+WEB_URI = "/ws"
+HOOK_URI = "/hook"
